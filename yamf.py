@@ -12,6 +12,7 @@ yamf_config.py:
 host = 'mailhost'
 port = 'port'
 ssl = True
+mailsperdir = 1000
 
 user = 'username'
 pw = 'password'
@@ -22,11 +23,11 @@ pattern = '*' # mailboxes to match
 
 class IMAPJSONEncoder(json.JSONEncoder):
     @classmethod
-    def dump(cls, obj, fd):
-        return json.dump(cls.transmute(obj), fd, cls=cls)
+    def dump(cls, obj, fd, **kwparams):
+        return json.dump(cls.transmute(obj), fd, cls=cls, **kwparams)
     @classmethod
-    def dumps(cls, obj):
-        return json.dumps(cls.transmute(obj), cls=cls)
+    def dumps(cls, obj, **kwparams):
+        return json.dumps(cls.transmute(obj), cls=cls, **kwparams)
     @classmethod
     def transmute(cls, obj):
         if isinstance(obj, bytes):
@@ -61,7 +62,7 @@ class IMAPJSONEncoder(json.JSONEncoder):
             return newobj
 
 class yamf:
-    def __init__(self, host, port, ssl, user, pw):
+    def __init__(self, host, port, ssl, user, pw, mails_per_dir = 10000):
         self.host = host
         self.user = user
         self.imap = imapclient.IMAPClient(host, port, ssl=ssl, use_uid=False)
@@ -69,6 +70,7 @@ class yamf:
         resp = self.imap.login(user, pw)
         print(resp.decode())
         self.imap.normalise_times = False
+        self.mails_per_dir = mails_per_dir
     def __del__(self):
         resp = self.imap.logout()
         print(resp.decode())
@@ -77,11 +79,12 @@ class yamf:
     #    print(result)
     #    import pdb; pdb.set_trace()
     def _go_subrange(self, path, msgnums):
+        os.makedirs(path, exist_ok=True)
         msgs = self.imap.fetch(msgnums, 'UID FLAGS INTERNALDATE RFC822 RFC822.SIZE ENVELOPE'.split(' '))
         try:
             msgslabels = self.imap.get_gmail_labels(msgnums)
             msgs = [{
-                **msgs[num], **msglables[num]
+                **msgs[num], **msgslabels[num]
             } for num in msgnums]
         except:
             msgs = [msgs[num] for num in msgnums]
@@ -91,9 +94,9 @@ class yamf:
             with open(fn, 'wb') as fd:
                 fd.write(msg.pop(b'RFC822'))
             with open(fn + '.json', 'w') as fd:
-                IMAPJSONEncoder.dump(msg, fd)
+                IMAPJSONEncoder.dump(msg, fd, indent=2)
             print(fn)
-    def go(self, directory='', pattern='*', blocksize=128):
+    def go(self, directory='', pattern='*', blocksize=64):
         folders = self.imap.list_folders(directory=directory, pattern=pattern)
         print(folders)
         for flags, delimiter, folder in folders:
@@ -101,12 +104,20 @@ class yamf:
             path = os.path.join('imap', *folder.split(delimiter.decode()))
             os.makedirs(path, exist_ok=True)
             with open(path + '.json', 'w') as folderjson:
-                IMAPJSONEncoder.dump({'folder_flags': flags, **select}, folderjson)
+                IMAPJSONEncoder.dump({'folder_flags': flags, **select}, folderjson, indent=2)
             exists = select[b'EXISTS']
             print(flags, delimiter, folder, select)
             for idx in range(1,exists+1, blocksize):
-                msgnums = [*range(idx, min(idx + blocksize, exists))]
-                self._go_subrange(path, msgnums)
+                subidx = idx
+                nextidx = min(idx + blocksize, exists)
+                while subidx < nextidx:
+                    subfnum = self._idx2subfoldernum(subidx)
+                    msgnums = [*range(subidx, min(nextidx+1, subfnum + self.mails_per_dir))]
+                    self._go_subrange(os.path.join(path, f'{subfnum:08}'), msgnums)
+                    subidx = msgnums[-1] + 1
+    def _idx2subfoldernum(self, idx):
+        num = (idx // self.mails_per_dir) * self.mails_per_dir
+        return num
 
 #class yamf:
 #
@@ -137,7 +148,7 @@ class yamf:
 #        print(data)
 
 def main():
-    client = yamf(cfg.host, cfg.port, cfg.ssl, cfg.user, cfg.pw)
+    client = yamf(cfg.host, cfg.port, cfg.ssl, cfg.user, cfg.pw, mails_per_dir=cfg.mailsperdir)
     client.go(pattern=cfg.pattern)
     #client.gmail_go()
 
